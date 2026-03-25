@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import random
 import sys
@@ -10,10 +11,10 @@ from notifier import notify
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 
-POLL_MIN = 0.3   # min seconds between polls
-POLL_MAX = 0.4   # max seconds between polls (randomized)
-WINDOW = 30      # seconds before/after target time to poll
-MAX_CALLS = 180  # hard cap per window — bot stops polling after this
+POLL_FASTEST = 0.2  # seconds between polls at peak (center of window)
+POLL_SLOWEST = 3.0  # seconds between polls at edges of window
+WINDOW = 30         # seconds before/after target time to poll
+MAX_CALLS = 180     # hard cap per window — bot stops polling after this
 
 
 def load_config():
@@ -49,7 +50,27 @@ def seconds_until(time_str):
         return 3600
 
 
-def try_buy(client, job):
+def poll_interval(time_str):
+    """Return poll interval using a normal distribution centered on target time.
+    Fastest at center, slowest at edges."""
+    now = datetime.now()
+    try:
+        h, m = map(int, time_str.split(":"))
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        offset = abs((now - target).total_seconds())
+
+        # Gaussian: e^(-(x^2)/(2*sigma^2)), sigma = WINDOW/3 so edges ≈ 0
+        sigma = WINDOW / 3
+        weight = math.exp(-(offset ** 2) / (2 * sigma ** 2))
+
+        # weight=1 at center → POLL_FASTEST, weight≈0 at edges → POLL_SLOWEST
+        interval = POLL_SLOWEST - weight * (POLL_SLOWEST - POLL_FASTEST)
+        return interval + random.uniform(0, 0.1)
+    except ValueError:
+        return POLL_SLOWEST
+
+
+def try_buy(client, job, dry_run=False):
     """Check availability and purchase if possible. Returns True on success."""
     item_id = job["item_id"]
     store = job["store_name"]
@@ -61,6 +82,10 @@ def try_buy(client, job):
         available = item.get("items_available", 0)
 
         if available > 0:
+            if dry_run:
+                print(f"  [{ts}] {store} — {available} bag(s) found! [TEST MODE — not purchasing]")
+                notify("2GoodToGo - TEST", f"Would have bought {qty}x bag at {store}.")
+                return True
             print(f"  [{ts}] {store} — {available} bag(s) found! Purchasing...")
             order = client.create_order(item_id=item_id, item_count=qty)
             notify(
@@ -83,12 +108,16 @@ def try_buy(client, job):
 
 
 def main():
+    dry_run = "--test" in sys.argv
+
     print("=" * 50)
-    print("  2GoodToGo Bot")
+    print("  2GoodToGo Bot" + (" [TEST MODE]" if dry_run else ""))
     print("=" * 50)
+    if dry_run:
+        print("\n  Test mode: will poll but NOT purchase.\n")
 
     client = get_client()
-    print("\nBot is running. Press Ctrl+C to stop.\n")
+    print("Bot is running. Press Ctrl+C to stop.\n")
 
     purchased_today = set()
     current_date = datetime.now().date()
@@ -132,7 +161,7 @@ def main():
                     print(f"  [{ts}] {job['store_name']} — hit {MAX_CALLS} call limit, waiting for next window")
                     continue
 
-                if try_buy(client, job):
+                if try_buy(client, job, dry_run=dry_run):
                     purchased_today.add(job["id"])
                     bought_any = True
                 else:
@@ -141,13 +170,15 @@ def main():
             if bought_any:
                 continue
 
-            # If any job is in window and under limit, keep polling fast
-            any_active = any(
-                in_window(j["time"]) and call_counts.get(j["id"], 0) < MAX_CALLS
-                for j in jobs
-            )
-            if any_active:
-                time.sleep(random.uniform(POLL_MIN, POLL_MAX))
+            # If any job is in window and under limit, poll with bell curve timing
+            active_jobs = [
+                j for j in jobs
+                if in_window(j["time"]) and call_counts.get(j["id"], 0) < MAX_CALLS
+            ]
+            if active_jobs:
+                # Use the fastest interval among active jobs
+                interval = min(poll_interval(j["time"]) for j in active_jobs)
+                time.sleep(interval)
             else:
                 # Sleep until next window
                 wait = min(seconds_until(j["time"]) for j in jobs)
